@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "videoDepthAnything"
+description = "Video Depth Anything: Consistent Depth Estimation for Super-Long Videos"
+version = "0.1"
+dependencies = [
+    'numpy==1.26.4',
+    'torch==2.2.0',
+    'torchvision==0.17.0',
+    'opencv-python==4.11.0.86',
+    'matplotlib==3.8.1',
+    'pillow==10.3.0',
+    'imageio==2.9.0',
+    'imageio_ffmpeg==0.6.0',
+    'decord==0.6.0',
+    'einops==0.8.1',
+    'easydict==1.10.0',
+    'tqdm==4.63.2',
+    'OpenEXR==3.2.4',
+]
+
+[tool.setuptools.packages]
+find = {}
