@@ -153,4 +153,104 @@ class VideoDepthAnything(nn.Module):
         depth_list = depth_list_aligned
             
         return np.stack(depth_list[:org_video_len], axis=0), target_fps
-        
+
+
+class OptimizedVideoDepthAnything(VideoDepthAnything):
+
+    def infer_video_depth(self, frames, height, width, org_video_len, input_size=512, device='cuda', fp32=False):
+        # a ratio smaller than 16:9 is recommended due to memory limitations
+        ratio = max(height, width) / min(height, width)
+        if ratio > 1.78:
+            input_size = int(input_size * 1.777 / ratio)
+            input_size = round(input_size / 14) * 14
+
+        # define tensors transformations
+        transform = Compose([
+            Resize(
+                width=input_size,
+                height=input_size,
+                resize_target=False,
+                keep_aspect_ratio=True,
+                ensure_multiple_of=14,
+                resize_method='lower_bound',
+                image_interpolation_method=cv2.INTER_CUBIC,
+            ),
+            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            PrepareForNet(),
+        ])
+
+        frame_step = INFER_LEN - OVERLAP
+        org_video_len = frames.shape[0]
+
+        # pad required frames to fit the model input size
+        append_frame_len = (frame_step - (org_video_len % frame_step)) % frame_step + (INFER_LEN - frame_step)
+        padding = np.repeat(frames[-1:], append_frame_len, axis=0)
+        frames = np.concatenate((frames, padding), axis=0)
+
+        depth_list = []
+        pre_input = None
+        for frame_id in tqdm(range(0, org_video_len, frame_step)):
+            cur_list = []
+            for i in range(INFER_LEN):
+                cur_frame = {'image': frames[frame_id+i].astype(np.float32) / 255.0} #TODO maybe do this before in the node when loading images ?
+                cur_frame_t = torch.from_numpy(transform(cur_frame)['image']).unsqueeze(0).unsqueeze(0)
+                cur_list.append(cur_frame_t)
+
+            cur_input = torch.cat(cur_list, dim=1).to(device)
+            if pre_input is not None:
+                cur_input[:, :OVERLAP, ...] = pre_input[:, KEYFRAMES, ...]
+
+            # inference
+            with torch.no_grad():
+                with torch.autocast(device_type=device, enabled=(not fp32)):
+                    depth = self.forward(cur_input) # depth shape: [1, T, H, W]
+
+            depth = depth.to(cur_input.dtype)
+            depth = F.interpolate(depth.flatten(0,1).unsqueeze(1), size=(height, width), mode='bilinear', align_corners=True)
+            depth_list += [depth[i][0].cpu().numpy() for i in range(depth.shape[0])]
+
+            pre_input = cur_input
+
+        return depth_list
+
+    def align_depths(self, depth_list, org_video_len):
+        depth_list_aligned = []
+        ref_align = []
+        align_len = OVERLAP - INTERP_LEN
+        kf_align_list = KEYFRAMES[:align_len]
+
+        for frame_id in range(0, len(depth_list), INFER_LEN):
+            if len(depth_list_aligned) == 0:
+                depth_list_aligned += depth_list[:INFER_LEN]
+                for kf_id in kf_align_list:
+                    ref_align.append(depth_list[frame_id+kf_id])
+            else:
+                curr_align = []
+                for i in range(len(kf_align_list)):
+                    curr_align.append(depth_list[frame_id+i])
+                scale, shift = compute_scale_and_shift(np.concatenate(curr_align),
+                                                       np.concatenate(ref_align),
+                                                       np.concatenate(np.ones_like(ref_align)))
+
+                pre_depth_list = depth_list_aligned[-INTERP_LEN:]
+                post_depth_list = depth_list[frame_id+align_len:frame_id+OVERLAP]
+                for i in range(len(post_depth_list)):
+                    # Apply scale/shift on new depth maps
+                    post_depth_list[i] = post_depth_list[i] * scale + shift
+                    # clamp negative values
+                    post_depth_list[i][post_depth_list[i]<0] = 0
+                # interpolate between the last aligned frame and the first new frame for a smoother transition
+                depth_list_aligned[-INTERP_LEN:] = get_interpolate_frames(pre_depth_list, post_depth_list)
+
+                for i in range(OVERLAP, INFER_LEN):
+                    new_depth = depth_list[frame_id+i] * scale + shift
+                    new_depth[new_depth<0] = 0
+                    depth_list_aligned.append(new_depth)
+
+                ref_align = ref_align[:1]
+                for kf_id in kf_align_list[1:]:
+                    new_depth = depth_list[frame_id+kf_id] * scale + shift
+                    new_depth[new_depth<0] = 0
+                    ref_align.append(new_depth)
+
+        return np.stack(depth_list_aligned[:org_video_len], axis=0)
